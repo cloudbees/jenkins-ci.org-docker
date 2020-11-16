@@ -1,135 +1,154 @@
-#!/usr/bin/env groovy
-
-properties([
-    buildDiscarder(logRotator(numToKeepStr: '50', artifactNumToKeepStr: '5')),
-    pipelineTriggers([cron('''H H/6 * * 0-2,4-6
-H 6,21 * * 3''')])
-])
-
-
-stage('Build') {
-    def builds = [:]
-    builds['windows'] = {
-        nodeWithTimeout('windock') {
-            stage('Checkout') {
-                checkout scm
-            }
-
-            if (!infra.isTrusted()) {
-
-                /* Outside of the trusted.ci environment, we're building and testing
-                * the Dockerfile in this repository, but not publishing to docker hub
-                */
-                stage('Build') {
-                    powershell './make.ps1'
-                }
-
-                stage('Test') {
-                    def windowsTestStatus = powershell(script: './make.ps1 test', returnStatus: true)
-                    junit(allowEmptyResults: true, keepLongStdio: true, testResults: 'target/**/junit-results.xml')
-                    if (windowsTestStatus > 0) {
-                        error('Windows test stage failed.')
+pipeline {
+    agent none
+    options {
+        buildDiscarder(logRotator(artifactNumToKeepStr: '5', numToKeepStr: '50'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+    }
+    triggers {
+        cron(env.BRANCH_NAME == 'master' ? '''H H/6 * * 0-2,4-6
+H 6,21 * * 3''' : '')
+    }
+    stages {
+        stage('BuildAndTest') {
+            matrix {
+                agent { label "${PLATFORM.equals('windows') ? 'winlock' : 'linux'}" }
+                axes {
+                    axis {
+                        name 'PLATFORM'
+                        values 'amd64', 'arm64', 's390x', 'ppc64le', 'windows'
+                    }
+                    axis {
+                        name 'FLAVOR'
+                        values 'debian', 'slim', 'alpine', 'jdk11', 'centos', 'centos7', 'windows'
                     }
                 }
-
-                def branchName = "${env.BRANCH_NAME}"
-                if (branchName ==~ 'master'){
+                excludes {
+                    exclude {
+                        axis {
+                            name 'PLATFORM'
+                            notValues 'windows'
+                        }
+                        axis {
+                            name 'FLAVOR'
+                            values 'windows'
+                        }
+                    }
+                    exclude {
+                        axis {
+                            name 'PLATFORM'
+                            values 'arm64'
+                        }
+                        axis {
+                            name 'FLAVOR'
+                            notValues 'debian', 'slim', 'jdk11'
+                        }
+                    }
+                    exclude {
+                        axis {
+                            name 'PLATFORM'
+                            values 's390x'
+                        }
+                        axis {
+                            name 'FLAVOR'
+                            notValues 'jdk11'
+                        }
+                    }
+                    exclude {
+                        axis {
+                            name 'PLATFORM'
+                            values 'ppc64le'
+                        }
+                        axis {
+                            name 'FLAVOR'
+                            notValues 'jdk11'
+                        }
+                    }
+                }
+                stages {
+                    stage('Build') {
+                        when {
+                            expression { !isTrusted() }
+                        }
+                        steps {
+                            cmd(linux: "make build-${FLAVOR}", windows: './make.ps1')
+                        }
+                    }
+                    stage('Test') {
+                        when {
+                            expression { !isTrusted() }
+                        }
+                        steps {
+                            cmd(linux: "make prepare-test test-${FLAVOR}", windows: './make.ps1 test')
+                        }
+                        post {
+                            always {
+                                junit(allowEmptyResults: true, keepLongStdio: true, testResults: 'target/**/junit-results.xml')
+                            }
+                        }
+                    }
                     stage('Publish Experimental') {
-                        infra.withDockerCredentials {
-                            withEnv(['DOCKERHUB_ORGANISATION=jenkins4eval','DOCKERHUB_REPO=jenkins']) {
-                                powershell './make.ps1 publish'
+                        when {
+                            branch 'master'
+                            expression { !isTrusted() }
+                        }
+                        steps {
+                            withDockerCredentials {
+                                withEnv(['DOCKERHUB_ORGANISATION=jenkins4eval','DOCKERHUB_REPO=jenkins']) {
+                                    cmd(linux: 'make publish-tags publish-manifests', windows: './make.ps1 publish')
+                                }
+                            }
+                        }
+                    }
+                    stage('Publish') {
+                        when {
+                            beforeAgent true
+                            expression { isTrusted() }
+                        }
+                        steps {
+                            withDockerCredentials {
+                                withEnv(['DOCKERHUB_ORGANISATION=jenkins','DOCKERHUB_REPO=jenkins']) {
+                                    cmd(linux: 'make publish', windows: './make.ps1 publish')
+                                }
                             }
                         }
                     }
                 }
-            } else {
-                /* In our trusted.ci environment we only want to be publishing our
-                * containers from artifacts
-                */
-                stage('Publish') {
-                    infra.withDockerCredentials {
-                        withEnv(['DOCKERHUB_ORGANISATION=jenkins','DOCKERHUB_REPO=jenkins']) {
-                            powershell './make.ps1 publish'
-                        }
+                post {
+                    always {
+                        dockerCleanup()
                     }
                 }
             }
         }
     }
-
-    builds['linux'] = {
-        nodeWithTimeout('docker') {
-            deleteDir()
-
-            stage('Checkout') {
-                checkout scm
-            }
-
-            if (!infra.isTrusted()) {
-
-                stage('shellcheck') {
-                    // run shellcheck ignoring error SC1091
-                    // Not following: /usr/local/bin/jenkins-support was not specified as input
-                    sh 'make shellcheck'
-                }
-
-                /* Outside of the trusted.ci environment, we're building and testing
-                * the Dockerfile in this repository, but not publishing to docker hub
-                */
-                stage('Build') {
-                    sh 'make build'
-                }
-
-                stage('Prepare Test') {
-                    sh "make prepare-test"
-                }
-
-                def labels = ['debian', 'slim', 'alpine', 'jdk11', 'centos', 'centos7']
-                def builders = [:]
-                for (x in labels) {
-                    def label = x
-
-                    // Create a map to pass in to the 'parallel' step so we can fire all the builds at once
-                    builders[label] = {
-                        stage("Test ${label}") {
-                            sh "make test-$label"
-                            junit(allowEmptyResults: true, keepLongStdio: true, testResults: 'target/*.xml')
-                        }
-                    }
-                }
-
-                parallel builders
-
-                def branchName = "${env.BRANCH_NAME}"
-                if (branchName ==~ 'master'){
-                    stage('Publish Experimental') {
-                        infra.withDockerCredentials {
-                            sh 'make publish-tags'
-                            sh 'make publish-manifests'
-                        }
-                    }
-                }
-            } else {
-                /* In our trusted.ci environment we only want to be publishing our
-                * containers from artifacts
-                */
-                stage('Publish') {
-                    infra.withDockerCredentials {
-                        sh 'make publish'
-                    }
-                }
-            }
-        }
-    }
-
-    parallel builds
 }
 
+// Wrapper to call a command OS agnostic
+def cmd(args) {
+    def returnStatus = args.get('returnStatus', false)
+    if(isUnix) {
+        sh(script: args.linux, returnStatus: returnStatus)
+    } else {
+        powershell(script: args.windows, returnStatus: returnStatus)
+    }
+}
 
-void nodeWithTimeout(String label, def body) {
-    node(label) {
-        timeout(time: 60, unit: 'MINUTES') {
-            body.call()
-        }
+// Wrapper to cleanup the docker images
+def dockerCleanup() {
+    cmd(linux: 'docker system prune --force --all',
+        windows: '& docker system prune --force --all',
+        returnStatus: true)
+}
+
+// Wrapper to avoid the script closure in the declarative pipeline
+def isTrusted() {
+    return infra.isTrusted()
+}
+
+// Wrapper to avoid the script closure in the declarative pipeline
+def withDockerCredentials(body) {
+    infra.withDockerCredentials {
+        body()
     }
 }
